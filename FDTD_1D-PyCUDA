@@ -1,0 +1,115 @@
+"""
+Created on Fri Jun  4 19:36:36 2021
+@author: FDTD 1D with PyCuda by MJLU
+"""
+import numpy as np
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+import pdb
+
+mod = SourceModule("""
+    #include <math.h>
+  __global__ void fdtd_e(float *Hy, float *Ez, float *Ceze, float *Cezhy, float *Cezj ,float *Jz)
+  {
+    int idx = (blockDim.x*blockIdx.x + threadIdx.x);
+    Ez[idx+2] = Ceze[idx+2] *  Ez[idx+2] + Cezhy[idx+2] * (Hy[idx+2] - Hy[idx+1]) + Cezj[idx+2] * Jz[idx+2];
+
+  }
+  
+  __global__ void fdtd_h(float *Hy, float *Ez, float *Chyh, float *Chyez, float *Chym ,float *My)
+  {
+    int idx = (blockDim.x*blockIdx.x + threadIdx.x);
+    
+    Hy[idx] = Chyh[idx]*Hy[idx] + Chyez[idx] * (Ez[idx+1] - Ez[idx])  + Chym[idx] * My[idx];
+  }
+  """)
+  
+#  Define initial constants
+eps_0 = 8.854187817e-12;          # permittivity of free space  
+mu_0  = 4*np.pi*1e-7;                # permeability of free space    
+c     = 1/np.sqrt(mu_0*eps_0);       # speed of light 
+
+# Define problem geometry and parameters
+domain_size = 1;                  # 1D problem space length in meters
+dx = 1e-3;                        # cell size in meters   
+dt = 3e-12;                       # duration of time step in seconds  
+number_of_time_steps = 10000;      # number of iterations 
+nx = int(np.round(domain_size/dx));       # number of cells in 1D problem space
+source_position = 0.5;            # position of the current source Jz
+
+# Initialize field and material arrays
+Ceze      = np.zeros((nx+1,1));
+Cezhy     = np.zeros((nx+1,1));
+Cezj      = np.zeros((nx+1,1));
+Ez        = np.zeros((nx+1,1));
+Jz        = np.zeros((nx+1,1));
+eps_r_z   = np.ones ((nx+1,1)); # free space
+sigma_e_z = np.zeros((nx+1,1)); # free space
+
+Chyh      = np.zeros((nx,1));
+Chyez     = np.zeros((nx,1));
+Chym      = np.zeros((nx,1));
+Hy        = np.zeros((nx,1));
+My        = np.zeros((nx,1));
+mu_r_y    = np.ones((nx,1)); # free space
+sigma_m_y = np.zeros((nx,1)); # free space
+
+# Calculate FDTD updating coefficients 
+Ceze = (2 * eps_r_z * eps_0 - dt * sigma_e_z)/(2 * eps_r_z * eps_0 + dt * sigma_e_z);
+Cezhy = (2 * dt / dx)/(2 * eps_r_z * eps_0 + dt * sigma_e_z);
+Cezj  = (-2 * dt)/(2 * eps_r_z * eps_0 + dt * sigma_e_z);
+Chyh  = (2 * mu_r_y * mu_0 - dt * sigma_m_y)/(2 * mu_r_y * mu_0 + dt * sigma_m_y);
+Chyez = (2 * dt / dx)/(2 * mu_r_y * mu_0 + dt * sigma_m_y);
+Chym  = (-2 * dt)/(2 * mu_r_y * mu_0 + dt * sigma_m_y);
+
+# cambiar doble precision - Arreglo hacia el cual transferir la inf
+Ceze = Ceze.astype(np.float32); Ceze_gpu = cuda.mem_alloc(Ceze.nbytes); cuda.memcpy_htod(Ceze_gpu,Ceze) 
+Cezhy = Cezhy.astype(np.float32); Cezhy_gpu = cuda.mem_alloc(Cezhy.nbytes); cuda.memcpy_htod(Cezhy_gpu,Cezhy) 
+Cezj = Cezj.astype(np.float32); Cezj_gpu = cuda.mem_alloc(Cezj.nbytes); cuda.memcpy_htod(Cezj_gpu,Cezj) 
+Chyh = Chyh.astype(np.float32); Chyh_gpu = cuda.mem_alloc(Chyh.nbytes); cuda.memcpy_htod(Chyh_gpu,Chyh) 
+Chyez = Chyez.astype(np.float32); Chyez_gpu = cuda.mem_alloc(Chyez.nbytes); cuda.memcpy_htod(Chyez_gpu,Chyez) 
+Chym = Chym.astype(np.float32); Chym_gpu = cuda.mem_alloc(Chym.nbytes); cuda.memcpy_htod(Chym_gpu,Chym) 
+
+
+Ez = Ez.astype(np.float32); Ez_gpu = cuda.mem_alloc(Ez.nbytes); cuda.memcpy_htod(Ez_gpu,Ez) 
+eps_r_z = eps_r_z.astype(np.float32); eps_r_z_gpu = cuda.mem_alloc(eps_r_z.nbytes); cuda.memcpy_htod(eps_r_z_gpu,eps_r_z) 
+sigma_e_z = sigma_e_z.astype(np.float32); sigma_e_z_gpu = cuda.mem_alloc(sigma_e_z.nbytes); cuda.memcpy_htod(sigma_e_z_gpu,sigma_e_z) 
+
+Hy = Hy.astype(np.float32); Hy_gpu = cuda.mem_alloc(Hy.nbytes); cuda.memcpy_htod(Hy_gpu,Hy) 
+My = My.astype(np.float32); My_gpu = cuda.mem_alloc(My.nbytes); cuda.memcpy_htod(My_gpu,My) 
+mu_r_y = mu_r_y.astype(np.float32); mu_r_y_gpu = cuda.mem_alloc(mu_r_y.nbytes); cuda.memcpy_htod(mu_r_y_gpu,mu_r_y) 
+sigma_m_y = sigma_m_y.astype(np.float32); sigma_m_y_gpu = cuda.mem_alloc(sigma_m_y.nbytes); cuda.memcpy_htod(sigma_m_y_gpu,sigma_m_y) 
+
+func_e = mod.get_function("fdtd_e")
+func_h = mod.get_function("fdtd_h")
+
+# Define the Gaussian source waveform 
+t = np.arange(0,number_of_time_steps,1)
+time       = dt*t;
+Jz_waveform = np.exp(-((time-2e-10)/5e-11)**2);
+source_position_index = int(np.round(nx*source_position/domain_size)+1);
+
+# FDTD loop
+for time_step in tqdm(range(number_of_time_steps)):
+    
+    Jz[source_position_index] = Jz_waveform[time_step]  
+    Jz = Jz.astype(np.float32); Jz_gpu = cuda.mem_alloc(Jz.nbytes); cuda.memcpy_htod(Jz_gpu,Jz)     
+    
+    func_h(Hy_gpu,Ez_gpu,Chyh_gpu,Chyez_gpu, Chym_gpu,My_gpu,block=(nx,1,1))
+    Hy = np.empty_like(Hy)
+    cuda.memcpy_dtoh(Hy, Hy_gpu)
+    cuda.memcpy_htod(Hy_gpu, Hy)
+    
+    func_e(Hy_gpu,Ez_gpu,Ceze_gpu,Cezhy_gpu, Cezj_gpu,Jz_gpu,block=(nx-1,1,1))
+    Ez = np.empty_like(Ez)
+    cuda.memcpy_dtoh(Ez, Ez_gpu)
+    Ez[0]  = 0; # Apply PEC boundary condition at x = 0 m
+    Ez[nx] = 0; # Apply PEC boundary condition at x = 1 m
+    cuda.memcpy_htod(Ez_gpu, Ez)
+        
+x = np.linspace(0,1,nx+1)
+plt.plot(x,Ez)
+plt.show
